@@ -599,13 +599,12 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
 
     // ---- ALU group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP (00-3B) ----
     static const VmOp alu_rr_op[8] = {
-        VMOP_ADD_RR, VMOP_OR_RR,  (VmOp)0xFF, (VmOp)0xFF,  // ADD OR ADC SBB (ADC/SBB -> NATIVE)
+        VMOP_ADD_RR, VMOP_OR_RR,  VMOP_ADC_RR, VMOP_SBB_RR,
         VMOP_AND_RR, VMOP_SUB_RR, VMOP_XOR_RR, VMOP_CMP_RR
     };
     if (op <= 0x3B && i.has_modrm) {
         uint8_t grp = (op >> 3) & 7;
         VmOp vop = alu_rr_op[grp];
-        if (vop == (VmOp)0xFF) return false; // ADC/SBB -> NATIVE
         bool rm_is_dst = !(op & 2); // direction: 0=rm/dst reg/src, 2=reg/dst rm/src
         uint8_t dst = rm_is_dst ? i.rm_id() : i.reg_id();
         uint8_t src = rm_is_dst ? i.reg_id() : i.rm_id();
@@ -616,17 +615,16 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
     }
     // GRP1 immediate (80-83)
     static const VmOp alu_ri32_op[8] = {
-        VMOP_ADD_RI32, VMOP_OR_RI32,  (VmOp)0xFF, (VmOp)0xFF,
+        VMOP_ADD_RI32, VMOP_OR_RI32,  VMOP_ADC_RI32, VMOP_SBB_RI32,
         VMOP_AND_RI32, VMOP_SUB_RI32, VMOP_XOR_RI32, VMOP_CMP_RI32
     };
     static const VmOp alu_ri8_op[8] = {
-        VMOP_ADD_RI8, VMOP_OR_RI8,  (VmOp)0xFF, (VmOp)0xFF,
+        VMOP_ADD_RI8, VMOP_OR_RI8,  VMOP_ADC_RI8, VMOP_SBB_RI8,
         VMOP_AND_RI8, VMOP_SUB_RI8, VMOP_XOR_RI8, VMOP_CMP_RI8
     };
     if ((op >= 0x80 && op <= 0x83) && i.has_modrm && i.mod_f == 3) {
         VmOp vop8  = alu_ri8_op[i.reg_f];
         VmOp vop32 = alu_ri32_op[i.reg_f];
-        if (vop8 == (VmOp)0xFF) return false;
         if (op == 0x81) { e.emit(vop32); e.emit_reg(i.rm_id()); e.emit_i32((int32_t)i.imm); return true; }
         e.emit(vop8); e.emit_reg(i.rm_id()); e.emit_u8((uint8_t)(int8_t)i.imm);
         return true;

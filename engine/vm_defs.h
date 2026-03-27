@@ -60,6 +60,8 @@ enum VmOp : uint8_t {
     // -- Arithmetic reg,reg  [dst:1][src:1] (updates RFLAGS) --
     VMOP_ADD_RR,
     VMOP_SUB_RR,
+    VMOP_ADC_RR,
+    VMOP_SBB_RR,
     VMOP_AND_RR,
     VMOP_OR_RR,
     VMOP_XOR_RR,
@@ -70,6 +72,8 @@ enum VmOp : uint8_t {
     // -- Arithmetic reg,imm8  [dst:1][imm8:1] --
     VMOP_ADD_RI8,
     VMOP_SUB_RI8,
+    VMOP_ADC_RI8,
+    VMOP_SBB_RI8,
     VMOP_AND_RI8,
     VMOP_OR_RI8,
     VMOP_XOR_RI8,
@@ -78,6 +82,8 @@ enum VmOp : uint8_t {
     // -- Arithmetic reg,imm32  [dst:1][imm32:4] --
     VMOP_ADD_RI32,
     VMOP_SUB_RI32,
+    VMOP_ADC_RI32,
+    VMOP_SBB_RI32,
     VMOP_AND_RI32,
     VMOP_OR_RI32,
     VMOP_XOR_RI32,

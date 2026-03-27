@@ -62,6 +62,29 @@ static inline void flags_sub(VmContext* ctx, uint64_t a, uint64_t b, uint64_t r)
     if ((a&0xF)<(b&0xF)) f |= RFLAG_AF;
 }
 
+static inline void flags_adc(VmContext* ctx, uint64_t a, uint64_t b, uint64_t cf_in, uint64_t r) {
+    uint64_t& f = ctx->regs[VR_RFLAGS];
+    f &= ~(RFLAG_CF|RFLAG_PF|RFLAG_AF|RFLAG_ZF|RFLAG_SF|RFLAG_OF);
+    if (!r) f |= RFLAG_ZF;
+    if (r>>63) f |= RFLAG_SF;
+    if (parity8((uint8_t)r)) f |= RFLAG_PF;
+    if (r < a || (cf_in && r == a)) f |= RFLAG_CF;
+    if (!((a^b)>>63) && ((a^r)>>63)) f |= RFLAG_OF;
+    if (((a&0xF)+(b&0xF)+cf_in)>0xF) f |= RFLAG_AF;
+}
+
+static inline void flags_sbb(VmContext* ctx, uint64_t a, uint64_t b, uint64_t cf_in, uint64_t r) {
+    uint64_t& f = ctx->regs[VR_RFLAGS];
+    f &= ~(RFLAG_CF|RFLAG_PF|RFLAG_AF|RFLAG_ZF|RFLAG_SF|RFLAG_OF);
+    if (!r) f |= RFLAG_ZF;
+    if (r>>63) f |= RFLAG_SF;
+    if (parity8((uint8_t)r)) f |= RFLAG_PF;
+    uint64_t full = b + cf_in;
+    if (a < full || (cf_in && b == ~0ULL)) f |= RFLAG_CF;
+    if (((a^b)>>63) && ((a^r)>>63)) f |= RFLAG_OF;
+    if ((a&0xF) < ((b&0xF)+cf_in)) f |= RFLAG_AF;
+}
+
 static inline bool eval_cond(uint8_t c, const VmContext* ctx) {
     uint64_t f = ctx->regs[VR_RFLAGS];
     bool CF=(f>>0)&1, PF=(f>>2)&1, ZF=(f>>6)&1, SF=(f>>7)&1, OF=(f>>11)&1;
@@ -207,6 +230,8 @@ void ArgalVmInterp(const uint8_t* bytecode, VmContext* ctx, const uint8_t* oprev
         // ALU reg,reg
         case VMOP_ADD_RR: { uint8_t d=r.reg(),s=r.reg(); uint64_t a=ctx->regs[d],b=ctx->regs[s]; ctx->regs[d]=a+b; flags_add(ctx,a,b,a+b); break; }
         case VMOP_SUB_RR: { uint8_t d=r.reg(),s=r.reg(); uint64_t a=ctx->regs[d],b=ctx->regs[s]; ctx->regs[d]=a-b; flags_sub(ctx,a,b,a-b); break; }
+        case VMOP_ADC_RR: { uint8_t d=r.reg(),s=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=ctx->regs[s],res=a+b+cf; ctx->regs[d]=res; flags_adc(ctx,a,b,cf,res); break; }
+        case VMOP_SBB_RR: { uint8_t d=r.reg(),s=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=ctx->regs[s],res=a-b-cf; ctx->regs[d]=res; flags_sbb(ctx,a,b,cf,res); break; }
         case VMOP_AND_RR: { uint8_t d=r.reg(),s=r.reg(); ctx->regs[d]&=ctx->regs[s]; flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_OR_RR:  { uint8_t d=r.reg(),s=r.reg(); ctx->regs[d]|=ctx->regs[s]; flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_XOR_RR: { uint8_t d=r.reg(),s=r.reg(); ctx->regs[d]^=ctx->regs[s]; flags_logic(ctx,ctx->regs[d]); break; }
@@ -217,6 +242,8 @@ void ArgalVmInterp(const uint8_t* bytecode, VmContext* ctx, const uint8_t* oprev
         // ALU reg,imm8
         case VMOP_ADD_RI8: { uint8_t d=r.reg(); uint64_t a=ctx->regs[d],b=(uint64_t)(int64_t)(int8_t)r.u8(); ctx->regs[d]=a+b; flags_add(ctx,a,b,a+b); break; }
         case VMOP_SUB_RI8: { uint8_t d=r.reg(); uint64_t a=ctx->regs[d],b=(uint64_t)(int64_t)(int8_t)r.u8(); ctx->regs[d]=a-b; flags_sub(ctx,a,b,a-b); break; }
+        case VMOP_ADC_RI8: { uint8_t d=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=(uint64_t)(int64_t)(int8_t)r.u8(),res=a+b+cf; ctx->regs[d]=res; flags_adc(ctx,a,b,cf,res); break; }
+        case VMOP_SBB_RI8: { uint8_t d=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=(uint64_t)(int64_t)(int8_t)r.u8(),res=a-b-cf; ctx->regs[d]=res; flags_sbb(ctx,a,b,cf,res); break; }
         case VMOP_AND_RI8: { uint8_t d=r.reg(); ctx->regs[d]&=(uint64_t)(int64_t)(int8_t)r.u8(); flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_OR_RI8:  { uint8_t d=r.reg(); ctx->regs[d]|=(uint64_t)(int64_t)(int8_t)r.u8(); flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_XOR_RI8: { uint8_t d=r.reg(); ctx->regs[d]^=(uint64_t)(int64_t)(int8_t)r.u8(); flags_logic(ctx,ctx->regs[d]); break; }
@@ -225,6 +252,8 @@ void ArgalVmInterp(const uint8_t* bytecode, VmContext* ctx, const uint8_t* oprev
         // ALU reg,imm32
         case VMOP_ADD_RI32: { uint8_t d=r.reg(); uint64_t a=ctx->regs[d],b=(uint64_t)(int64_t)r.i32(); ctx->regs[d]=a+b; flags_add(ctx,a,b,a+b); break; }
         case VMOP_SUB_RI32: { uint8_t d=r.reg(); uint64_t a=ctx->regs[d],b=(uint64_t)(int64_t)r.i32(); ctx->regs[d]=a-b; flags_sub(ctx,a,b,a-b); break; }
+        case VMOP_ADC_RI32: { uint8_t d=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=(uint64_t)(int64_t)r.i32(),res=a+b+cf; ctx->regs[d]=res; flags_adc(ctx,a,b,cf,res); break; }
+        case VMOP_SBB_RI32: { uint8_t d=r.reg(); uint64_t cf=(ctx->regs[VR_RFLAGS]>>0)&1,a=ctx->regs[d],b=(uint64_t)(int64_t)r.i32(),res=a-b-cf; ctx->regs[d]=res; flags_sbb(ctx,a,b,cf,res); break; }
         case VMOP_AND_RI32: { uint8_t d=r.reg(); ctx->regs[d]&=(uint64_t)(int64_t)r.i32(); flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_OR_RI32:  { uint8_t d=r.reg(); ctx->regs[d]|=(uint64_t)(int64_t)r.i32(); flags_logic(ctx,ctx->regs[d]); break; }
         case VMOP_XOR_RI32: { uint8_t d=r.reg(); ctx->regs[d]^=(uint64_t)(int64_t)r.i32(); flags_logic(ctx,ctx->regs[d]); break; }
