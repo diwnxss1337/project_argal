@@ -109,59 +109,119 @@ static inline bool eval_cond(uint8_t c, const VmContext* ctx) {
     return false;
 }
 
+// Scratch slot offsets inside VmContext:
+//   regs[VR_RSP]         = 0x20  (VR_RSP=4, 4*8=32)
+//   regs[VR_RFLAGS]      = 0x80  (VR_RFLAGS=16, 16*8=128)
+//   native_rsp_scratch   = 0x88  (17*8=136)
+static constexpr uint32_t k_vctx_rsp_off        = VR_RSP     * 8; // 0x20
+static constexpr uint32_t k_vctx_rflags_off     = VR_RFLAGS  * 8; // 0x80
+static constexpr uint32_t k_vctx_scratch_off    = VR_COUNT   * 8; // 0x88
+
+// Emit: REX.W + opcode + ModRM[mod=01,reg=r,rm=R10] + disp8
+// Used for offsets 0x00–0x7F (fits in signed 8-bit).
+static void emit_r10_op8(uint8_t*& p, uint8_t rex_extra,
+                          uint8_t opcode, uint8_t reg_field, uint8_t disp8) {
+    *p++ = static_cast<uint8_t>(0x49 | rex_extra); // REX.W + REX.B [+ extra]
+    *p++ = opcode;
+    *p++ = static_cast<uint8_t>(0x42 | ((reg_field & 7u) << 3)); // mod=01 reg=? rm=R10
+    *p++ = disp8;
+}
+
+// Emit: REX.W + opcode + ModRM[mod=10,reg=r,rm=R10] + disp32
+// Used for offsets >= 0x80 (needs 4-byte displacement).
+static void emit_r10_op32(uint8_t*& p, uint8_t rex_extra,
+                           uint8_t opcode, uint8_t reg_field, uint32_t disp32) {
+    *p++ = static_cast<uint8_t>(0x49 | rex_extra);
+    *p++ = opcode;
+    *p++ = static_cast<uint8_t>(0x82 | ((reg_field & 7u) << 3)); // mod=10 reg=? rm=R10
+    memcpy(p, &disp32, 4); p += 4;
+}
+
 static void exec_native(const uint8_t* bytes, uint8_t len, VmContext* ctx) {
     if (!len) return;
-    uint8_t* buf = (uint8_t*)VirtualAlloc(nullptr, 512,
-                        MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    // Sanity: basic check that ctx pointer looks valid before we touch it.
+    if (!ctx) return;
+
+    uint8_t* buf = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 512, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!buf) return;
+
     uint8_t* p = buf;
 
-    // push non-volatile registers
+    // ---- Prologue: save Windows x64 non-volatile GPRs ----
+    // push rbx, rsi, rdi, r12, r13, r14, r15  (7 pushes = 56 bytes)
     *p++=0x53; *p++=0x56; *p++=0x57;
     *p++=0x41;*p++=0x54; *p++=0x41;*p++=0x55;
     *p++=0x41;*p++=0x56; *p++=0x41;*p++=0x57;
 
-    // mov r10, ctx (imm64)
-    uint64_t ctx_addr = (uint64_t)ctx;
-    *p++=0x49; *p++=0xBA; memcpy(p,&ctx_addr,8); p+=8;
+    // mov r10, ctx  (imm64, 10 bytes)
+    uint64_t ctx_addr = reinterpret_cast<uint64_t>(ctx);
+    *p++=0x49; *p++=0xBA; memcpy(p, &ctx_addr, 8); p+=8;
 
-    // Load RFLAGS: mov rax,[r10+0x80]; push rax; popfq
-    *p++=0x49;*p++=0x8B;*p++=0x82;*p++=0x80;*p++=0;*p++=0;*p++=0;
-    *p++=0x50; *p++=0x9D;
+    // ---- Load RFLAGS from ctx (needs 4-byte disp since offset=0x80) ----
+    // mov rax, [r10+0x80]  →  49 8B 82 80 00 00 00
+    emit_r10_op32(p, 0x00, 0x8B, 0 /*rax*/, k_vctx_rflags_off);
+    *p++=0x50; *p++=0x9D; // push rax; popfq
 
-    // Load all GPRs except RSP and R10
-    auto load = [&](uint8_t vr) {
-        uint8_t off=vr*8;
-        uint8_t rex=(vr>=8)?0x4D:0x49;
-        uint8_t mrm=0x42|((vr&7)<<3);  // rm=2 → R10 (REX.B extends to index 10)
-        *p++=rex;*p++=0x8B;*p++=mrm;*p++=off;
+    // ---- Load all GPRs from ctx, except RSP (handled separately) and R10 ----
+    auto load_gpr = [&](uint8_t vr) {
+        uint8_t rex_extra = (vr >= 8) ? 0x04u : 0x00u; // REX.R for r8-r15 as dest
+        uint8_t disp8     = static_cast<uint8_t>(vr * 8u);
+        emit_r10_op8(p, rex_extra, 0x8B, vr, disp8);
     };
-    for (uint8_t r2=0;r2<16;++r2) { if(r2!=VR_RSP&&r2!=VR_R10) load(r2); }
+    for (uint8_t r2 = 0; r2 < 16; ++r2) {
+        if (r2 != VR_RSP && r2 != VR_R10) load_gpr(r2);
+    }
 
-    // Emit native instruction
-    memcpy(p, bytes, len); p+=len;
+    // ---- RSP swap: save real RSP into ctx->native_rsp_scratch, load virtual RSP ----
+    //
+    // mov [r10+0x88], rsp   →  49 89 A2 88 00 00 00   (mod=10, reg=RSP=4, rm=R10)
+    // Note: 0x88 > 0x7F so we need 4-byte disp (mod=10).
+    emit_r10_op32(p, 0x00, 0x89, VR_RSP /*rsp=4*/, k_vctx_scratch_off);
 
-    // Save GPRs (except RSP and R10) back
-    auto save = [&](uint8_t vr) {
-        uint8_t off=vr*8;
-        uint8_t rex=(vr>=8)?0x4D:0x49;
-        uint8_t mrm=0x42|((vr&7)<<3);  // rm=2 → R10 (REX.B extends to index 10)
-        *p++=rex;*p++=0x89;*p++=mrm;*p++=off;
+    // mov rsp, [r10+0x20]   →  49 8B 62 20            (mod=01, reg=RSP=4, rm=R10)
+    emit_r10_op8(p, 0x00, 0x8B, VR_RSP /*rsp=4*/, static_cast<uint8_t>(k_vctx_rsp_off));
+
+    // ---- Emit the native instruction bytes verbatim ----
+    memcpy(p, bytes, len); p += len;
+
+    // ---- RSP swap back: save (possibly modified) virtual RSP, restore real RSP ----
+    //
+    // mov [r10+0x20], rsp   →  49 89 62 20
+    emit_r10_op8(p, 0x00, 0x89, VR_RSP /*rsp=4*/, static_cast<uint8_t>(k_vctx_rsp_off));
+
+    // mov rsp, [r10+0x88]   →  49 8B A2 88 00 00 00
+    emit_r10_op32(p, 0x00, 0x8B, VR_RSP /*rsp=4*/, k_vctx_scratch_off);
+
+    // ---- Save all GPRs (except RSP already saved above, and R10) back to ctx ----
+    auto save_gpr = [&](uint8_t vr) {
+        uint8_t rex_extra = (vr >= 8) ? 0x04u : 0x00u;
+        uint8_t disp8     = static_cast<uint8_t>(vr * 8u);
+        emit_r10_op8(p, rex_extra, 0x89, vr, disp8);
     };
-    for (uint8_t r2=0;r2<16;++r2) { if(r2!=VR_RSP&&r2!=VR_R10) save(r2); }
+    for (uint8_t r2 = 0; r2 < 16; ++r2) {
+        if (r2 != VR_RSP && r2 != VR_R10) save_gpr(r2);
+    }
 
-    // Save RFLAGS: pushfq; pop rax; mov [r10+0x80],rax
-    *p++=0x9C;*p++=0x58;
-    *p++=0x49;*p++=0x89;*p++=0x82;*p++=0x80;*p++=0;*p++=0;*p++=0;
+    // ---- Save RFLAGS: pushfq; pop rax; mov [r10+0x80], rax ----
+    *p++=0x9C; *p++=0x58;
+    emit_r10_op32(p, 0x00, 0x89, 0 /*rax*/, k_vctx_rflags_off);
 
-    // pop non-volatile registers
-    *p++=0x41;*p++=0x5F;*p++=0x41;*p++=0x5E;
-    *p++=0x41;*p++=0x5D;*p++=0x41;*p++=0x5C;
-    *p++=0x5F;*p++=0x5E;*p++=0x5B;
+    // ---- Epilogue: restore non-volatile GPRs, return ----
+    *p++=0x41;*p++=0x5F; *p++=0x41;*p++=0x5E;
+    *p++=0x41;*p++=0x5D; *p++=0x41;*p++=0x5C;
+    *p++=0x5F; *p++=0x5E; *p++=0x5B;
     *p++=0xC3;
 
-    ((void(*)())buf)();
-    VirtualFree(buf,0,MEM_RELEASE);
+    // Sanity: make sure we didn't overflow the 512-byte buffer.
+    if (static_cast<size_t>(p - buf) > 512) {
+        VirtualFree(buf, 0, MEM_RELEASE);
+        return;
+    }
+
+    reinterpret_cast<void(*)()>(buf)();
+    VirtualFree(buf, 0, MEM_RELEASE);
 }
 
 __declspec(noinline)
@@ -303,27 +363,84 @@ void ArgalVmInterp(const uint8_t* bytecode, VmContext* ctx, const uint8_t* oprev
 
         // CALL (native dispatch)
         // Bytecode stores u32 RVA; add image_base for ASLR-safe absolute address.
+        //
+        // Win x64 ABI: rcx/rdx/r8/r9 = args 1-4; args 5+ go on the stack at
+        // [rsp+0x20], [rsp+0x28], ... (caller's perspective, before the CALL).
+        // The virtualized code writes those extra args to the virtual stack at
+        // ctx->regs[VR_RSP]+0x20 etc.  We read them out and forward them so
+        // that functions with more than 4 params (WinHttpOpenRequest, etc.) work.
+        //
+        // We dispatch as a 12-arg function — the callee ignores args it doesn't
+        // use; passing extras is harmless under the Win x64 ABI.
+        //
+        // Sanity: only read from the virtual stack if VR_RSP looks like a valid
+        // user-mode stack address (0x1000 – 0x7FFFFFFFFFFF).
         case VMOP_CALL_ABS: {
             uint64_t target = image_base + r.u32();
-            typedef uint64_t(*fn4)(uint64_t,uint64_t,uint64_t,uint64_t);
-            ctx->regs[VR_RAX]=((fn4)target)(ctx->regs[VR_RCX],ctx->regs[VR_RDX],
-                                              ctx->regs[VR_R8], ctx->regs[VR_R9]);
+            auto* vsp = reinterpret_cast<uint64_t*>(ctx->regs[VR_RSP]);
+            typedef uint64_t(*fn12_t)(uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t);
+            if (ctx->regs[VR_RSP] >= 0x1000ULL &&
+                ctx->regs[VR_RSP] <= 0x7FFFFFFFFFFFULL) {
+                ctx->regs[VR_RAX] = reinterpret_cast<fn12_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9],
+                    vsp[4], vsp[5], vsp[6],  vsp[7],
+                    vsp[8], vsp[9], vsp[10], vsp[11]);
+            } else {
+                // Fallback: degenerate RSP — call with 4 args only
+                typedef uint64_t(*fn4_t)(uint64_t,uint64_t,uint64_t,uint64_t);
+                ctx->regs[VR_RAX] = reinterpret_cast<fn4_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9]);
+            }
             break;
         }
         case VMOP_CALL_R: {
-            uint8_t s=r.reg();
-            typedef uint64_t(*fn4)(uint64_t,uint64_t,uint64_t,uint64_t);
-            ctx->regs[VR_RAX]=((fn4)ctx->regs[s])(ctx->regs[VR_RCX],ctx->regs[VR_RDX],
-                                                    ctx->regs[VR_R8], ctx->regs[VR_R9]);
+            uint8_t src_reg = r.reg();
+            uint64_t target = ctx->regs[src_reg];
+            auto* vsp = reinterpret_cast<uint64_t*>(ctx->regs[VR_RSP]);
+            typedef uint64_t(*fn12_t)(uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t);
+            if (ctx->regs[VR_RSP] >= 0x1000ULL &&
+                ctx->regs[VR_RSP] <= 0x7FFFFFFFFFFFULL) {
+                ctx->regs[VR_RAX] = reinterpret_cast<fn12_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9],
+                    vsp[4], vsp[5], vsp[6],  vsp[7],
+                    vsp[8], vsp[9], vsp[10], vsp[11]);
+            } else {
+                typedef uint64_t(*fn4_t)(uint64_t,uint64_t,uint64_t,uint64_t);
+                ctx->regs[VR_RAX] = reinterpret_cast<fn4_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9]);
+            }
             break;
         }
         // Indirect call through memory (IAT slot): target = *(image_base + rva32)
         // Handles FF/2 mod=0 rm=5 (call [rip+disp]) lifted by the obfuscator.
         case VMOP_CALL_MEM_ABS: {
-            uint64_t target = *(uint64_t*)(image_base + r.u32());
-            typedef uint64_t(*fn4)(uint64_t,uint64_t,uint64_t,uint64_t);
-            ctx->regs[VR_RAX]=((fn4)target)(ctx->regs[VR_RCX],ctx->regs[VR_RDX],
-                                             ctx->regs[VR_R8], ctx->regs[VR_R9]);
+            uint64_t ptr_addr = image_base + r.u32();
+            uint64_t target   = *reinterpret_cast<uint64_t*>(ptr_addr);
+            auto* vsp = reinterpret_cast<uint64_t*>(ctx->regs[VR_RSP]);
+            typedef uint64_t(*fn12_t)(uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t,
+                                      uint64_t,uint64_t,uint64_t,uint64_t);
+            if (ctx->regs[VR_RSP] >= 0x1000ULL &&
+                ctx->regs[VR_RSP] <= 0x7FFFFFFFFFFFULL) {
+                ctx->regs[VR_RAX] = reinterpret_cast<fn12_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9],
+                    vsp[4], vsp[5], vsp[6],  vsp[7],
+                    vsp[8], vsp[9], vsp[10], vsp[11]);
+            } else {
+                typedef uint64_t(*fn4_t)(uint64_t,uint64_t,uint64_t,uint64_t);
+                ctx->regs[VR_RAX] = reinterpret_cast<fn4_t>(target)(
+                    ctx->regs[VR_RCX], ctx->regs[VR_RDX],
+                    ctx->regs[VR_R8],  ctx->regs[VR_R9]);
+            }
             break;
         }
 

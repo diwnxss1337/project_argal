@@ -188,6 +188,11 @@ static constexpr uint64_t RFLAG_OF = (1ULL << 11);
 #pragma pack(push, 1)
 struct VmContext {
     uint64_t regs[VR_COUNT];  // regs[0..15] = RAX..R15, regs[16] = RFLAGS
+    // offset 0x88 (= VR_COUNT*8 = 17*8): scratch slot used by exec_native to
+    // preserve the real native RSP while swapping in the virtual RSP.
+    // The entry stub allocates exactly sizeof(VmContext) = 0x90 bytes on the
+    // stack (sub rsp, 0x90), so this field fits in the existing allocation.
+    uint64_t native_rsp_scratch;
 };
 
 // ============================================================================

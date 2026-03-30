@@ -506,7 +506,18 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
     if ((op == 0x8A || op == 0x8B) && i.has_modrm) {
         if (op == 0x8A) { const_cast<X64Insn&>(i).opsz = 8; }
         if (i.mod_f == 3) {
-            if (opsz == 8) return false; // 8-bit
+            if (opsz == 8) {
+                // 8-bit reg-to-reg: mov al, cl  etc.
+                // Implement as:  AND dst, ~0xFF;  MOVZX_RR8 scratch... but we
+                // have no scratch.  Use a two-step: clear low byte of dst,
+                // then OR in the zero-extended low byte of src.
+                //   AND dst, 0xFFFFFFFFFFFFFF00
+                //   AND src_copy (we need src unchanged!) — can't clobber src
+                // Simplest correct approach without a temp: fall to NATIVE.
+                // exec_native handles 8A/8B reg correctly (loads all GPRs,
+                // executes, saves all GPRs, correct low-byte semantics).
+                return false;
+            }
             e.emit(VMOP_MOV_RR); e.emit_reg(i.reg_id()); e.emit_reg(i.rm_id());
             return true;
         } else {
@@ -543,9 +554,30 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
 
     // ---- MOV r, imm  (B0-BF) ----
     if (op >= 0xB0 && op <= 0xB7) {
-        uint8_t r = (uint8_t)((op & 7) | (i.rex_b ? 8 : 0));
-        // 8-bit MOV — fall back to NATIVE (8-bit regs not fully modeled)
-        return false;
+        // Without any REX prefix, B4-B7 encode AH/CH/DH/BH (bits 8-15 of the
+        // register) — these high-byte aliases cannot be expressed in the VM's
+        // 64-bit register model, so fall through to NATIVE.
+        bool has_rex = i.rex_w || i.rex_r || i.rex_x || i.rex_b;
+        if (!has_rex && (op & 7u) >= 4u) return false; // AH/CH/DH/BH
+
+        uint8_t vreg = static_cast<uint8_t>((op & 7u) | (i.rex_b ? 8u : 0u));
+
+        // Implement  mov r8, imm8  as:
+        //   AND vreg, 0xFFFFFFFFFFFFFF00   (clears low 8 bits, sign-extend -256)
+        //   XOR vreg, (imm8 & 0xFF)        (sets low 8 bits; imm is 0..255 as
+        //                                   positive i32 so sign-extend is safe)
+        //
+        // The XOR_RI32 sign-extends its i32 operand to 64-bit.  For any value in
+        // 0x00..0xFF, the i32 is 0x000000xx (<0x80000000) so the 64-bit result
+        // has zeros in bits 8-63, meaning only the low byte changes.  After the
+        // AND zeroed those bits, XOR correctly OR-in the new byte value.
+        const int32_t mask_clear_low8 = -256; // 0xFFFFFF00, sign-extends to ...FF00
+        const int32_t byte_val = static_cast<int32_t>(
+            static_cast<uint32_t>(static_cast<uint8_t>(i.imm & 0xFF)));
+
+        e.emit(VMOP_AND_RI32); e.emit_reg(vreg); e.emit_i32(mask_clear_low8);
+        e.emit(VMOP_XOR_RI32); e.emit_reg(vreg); e.emit_i32(byte_val);
+        return true;
     }
     if (op >= 0xB8 && op <= 0xBF) {
         uint8_t r = (uint8_t)((op & 7) | (i.rex_b ? 8 : 0));
@@ -605,12 +637,55 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
     if (op <= 0x3B && i.has_modrm) {
         uint8_t grp = (op >> 3) & 7;
         VmOp vop = alu_rr_op[grp];
-        bool rm_is_dst = !(op & 2); // direction: 0=rm/dst reg/src, 2=reg/dst rm/src
+        bool rm_is_dst = !(op & 2); // direction bit: 0=rm/dst reg/src, 2=reg/dst rm/src
         uint8_t dst = rm_is_dst ? i.rm_id() : i.reg_id();
         uint8_t src = rm_is_dst ? i.reg_id() : i.rm_id();
-        if (i.mod_f != 3) return false; // mem operand -> NATIVE for now
+
+        // 8-bit forms (op & 1 == 0) fall through to NATIVE — exec_native handles
+        // the low-byte semantics correctly after the RSP-swap fix.
         if (opsz != 64 && opsz != 32) return false;
-        e.emit(vop); e.emit_reg(dst); e.emit_reg(src);
+
+        if (i.mod_f == 3) {
+            // Pure register-register ALU: simple and fast path.
+            e.emit(vop); e.emit_reg(dst); e.emit_reg(src);
+            return true;
+        }
+
+        // Memory operand.  Strategy: lift as load → ALU_RR → store.
+        // For instructions where rm is the SOURCE (op&2 == 2, e.g. add r,m):
+        //   tmp_reg = load(mem); alu dst_reg, tmp_reg
+        // For instructions where rm is the DESTINATION (op&2 == 0, e.g. add m,r):
+        //   tmp_reg = load(mem); alu tmp_reg, src_reg; store(mem, tmp_reg)
+        // CMP always reads rm — never writes back.
+        //
+        // We need a scratch register that is not already used as dst or src.
+        // We pick R11 (VR_R11=11) as scratch; if either operand already uses R11
+        // we fall to NATIVE to avoid clobbering it.
+        //
+        // Complex SIB or 8-bit operand size → NATIVE (exec_native handles those).
+        MemRef m = decode_memref(i);
+        if (m.complex_sib) return false;
+
+        static constexpr uint8_t k_scratch = VR_R11;
+        if (dst == k_scratch || src == k_scratch) return false; // scratch collision
+
+        // Determine which size variant of the load/store opcode to use.
+        VmOp load_op  = (opsz == 64) ? VMOP_MOV_RM64 : VMOP_MOV_RM32;
+        VmOp store_op = (opsz == 64) ? VMOP_MOV_MR64 : VMOP_MOV_MR32;
+
+        if (rm_is_dst) {
+            // add [mem], reg  →  scratch = load(mem); alu scratch, reg; store(mem, scratch)
+            // Exception: CMP — no writeback needed.
+            e.emit(load_op); e.emit_reg(k_scratch); emit_memref(m);
+            e.emit(vop);     e.emit_reg(k_scratch); e.emit_reg(src);
+            if (vop != VMOP_CMP_RR && vop != VMOP_TEST_RR) {
+                e.emit(store_op); emit_memref(m); e.emit_reg(k_scratch);
+            }
+        } else {
+            // add reg, [mem]  →  scratch = load(mem); alu dst_reg, scratch
+            e.emit(load_op); e.emit_reg(k_scratch); emit_memref(m);
+            e.emit(vop);     e.emit_reg(dst);        e.emit_reg(k_scratch);
+        }
         return true;
     }
     // GRP1 immediate (80-83)
@@ -622,11 +697,42 @@ static bool lift_insn(const X64Insn& i, BytecodeEmitter& e, const uint8_t* raw,
         VMOP_ADD_RI8, VMOP_OR_RI8,  VMOP_ADC_RI8, VMOP_SBB_RI8,
         VMOP_AND_RI8, VMOP_SUB_RI8, VMOP_XOR_RI8, VMOP_CMP_RI8
     };
-    if ((op >= 0x80 && op <= 0x83) && i.has_modrm && i.mod_f == 3) {
+    if ((op >= 0x80 && op <= 0x83) && i.has_modrm) {
+        if (opsz != 64 && opsz != 32 && op != 0x80) return false; // 8-bit → NATIVE
+
         VmOp vop8  = alu_ri8_op[i.reg_f];
         VmOp vop32 = alu_ri32_op[i.reg_f];
-        if (op == 0x81) { e.emit(vop32); e.emit_reg(i.rm_id()); e.emit_i32((int32_t)i.imm); return true; }
-        e.emit(vop8); e.emit_reg(i.rm_id()); e.emit_u8((uint8_t)(int8_t)i.imm);
+        bool is_cmp_or_test = (i.reg_f == 7); // CMP — no writeback
+
+        if (i.mod_f == 3) {
+            // Register operand — straightforward.
+            if (op == 0x81) {
+                e.emit(vop32); e.emit_reg(i.rm_id()); e.emit_i32((int32_t)i.imm);
+            } else {
+                e.emit(vop8); e.emit_reg(i.rm_id()); e.emit_u8((uint8_t)(int8_t)i.imm);
+            }
+            return true;
+        }
+
+        // Memory operand: load → ALU_imm → (optional) store back.
+        MemRef m = decode_memref(i);
+        if (m.complex_sib) return false;
+
+        static constexpr uint8_t k_scratch = VR_R11;
+        if (i.rm_id() == k_scratch) return false;
+
+        VmOp load_op  = (opsz == 64) ? VMOP_MOV_RM64 : VMOP_MOV_RM32;
+        VmOp store_op = (opsz == 64) ? VMOP_MOV_MR64 : VMOP_MOV_MR32;
+
+        e.emit(load_op); e.emit_reg(k_scratch); emit_memref(m);
+        if (op == 0x81) {
+            e.emit(vop32); e.emit_reg(k_scratch); e.emit_i32((int32_t)i.imm);
+        } else {
+            e.emit(vop8); e.emit_reg(k_scratch); e.emit_u8((uint8_t)(int8_t)i.imm);
+        }
+        if (!is_cmp_or_test) {
+            e.emit(store_op); emit_memref(m); e.emit_reg(k_scratch);
+        }
         return true;
     }
     // ALU rAX, imm (05/0D/15/1D/25/2D/35/3D)
