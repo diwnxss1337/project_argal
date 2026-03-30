@@ -70,6 +70,8 @@ static IMAGE_NT_HEADERS64* nt_hdr(uint8_t* pe) {
     return reinterpret_cast<IMAGE_NT_HEADERS64*>(pe + dos_hdr(pe)->e_lfanew);
 }
 
+// change here too
+
 static IMAGE_SECTION_HEADER* first_section(uint8_t* pe) {
     return IMAGE_FIRST_SECTION(nt_hdr(pe));
 }
