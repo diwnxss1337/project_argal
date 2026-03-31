@@ -4,6 +4,8 @@
 #include "restore_opcodes.h"
 #include "vm_interpreter.h"
 
+//change here
+
 static uint32_t g_crc_table[256];
 
 static void build_crc_table() {
