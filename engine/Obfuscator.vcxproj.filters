@@ -21,6 +21,9 @@
     <ClInclude Include="pe.h">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>
+    <ClInclude Include="pe_patch.h">
+      <Filter>Üst Bilgi Dosyaları</Filter>
+    </ClInclude>
     <ClInclude Include="u.h">
       <Filter>Üst Bilgi Dosyaları</Filter>
     </ClInclude>

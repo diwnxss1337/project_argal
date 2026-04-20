@@ -19,6 +19,7 @@
 #include "lzma2-compression.h"
 #include "vm_defs.h"
 #include "x64_lifter.h"
+#include "pe_patch.h"
 
 namespace crypto {
     inline void xor_crypt(uint8_t* data, size_t size, const uint8_t* key, size_t key_size) {
@@ -185,6 +186,14 @@ int main(int argc, char* argv[]) {
             if (end_va > image_base)   end_va   -= image_base;
             ranges.push_back({ static_cast<uint32_t>(start_va), static_cast<uint32_t>(end_va) });
         }
+
+        std::cout << "[*] applying pre-patches (rich/debug/version/imports)\n";
+        {
+            std::mt19937 patch_rng(std::random_device{}());
+            pe_patch::apply_pre_patches(pe_data, patch_rng);
+        }
+        dos = dos_hdr(pe_data.data());
+        nt  = nt_hdr(pe_data.data());
 
         if (vm_mode) {
             // Seed the RNG with multiple entropy sources so each build
@@ -429,6 +438,9 @@ int main(int argc, char* argv[]) {
             nt->OptionalHeader.AddressOfEntryPoint = ep_stub_rva;
             nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] = {};
 
+            std::cout << "[*] applying post-patches (names/perms/export/timestamps/checksum)\n";
+            pe_patch::apply_post_patches(pe_data);
+
             write_file(output_path, pe_data);
             std::cout << "[+] vm done.\n";
             return 0;
@@ -599,6 +611,10 @@ int main(int argc, char* argv[]) {
         nt->OptionalHeader.AddressOfEntryPoint = stub_rva;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].VirtualAddress = 0;
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT].Size = 0;
+
+        std::cout << "[*] applying post-patches (names/perms/export/timestamps/checksum)\n";
+        pe_patch::apply_post_patches(pe_data);
+
         write_file(output_path, pe_data);
         std::cout << "[+] done.\n";
 

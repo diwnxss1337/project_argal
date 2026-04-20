@@ -129,6 +129,7 @@
   <ItemGroup>
     <ClInclude Include="opcode.h" />
     <ClInclude Include="pe.h" />
+    <ClInclude Include="pe_patch.h" />
     <ClInclude Include="u.h" />
     <ClInclude Include="vm_defs.h" />
     <ClInclude Include="x64_lifter.h" />

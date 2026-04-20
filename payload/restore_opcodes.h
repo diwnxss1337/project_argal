@@ -43,18 +43,21 @@ namespace restore {
         auto* sections = IMAGE_FIRST_SECTION(nt);
         uint8_t* section_data = nullptr;
 
-        // Find .argal section
+        // Section names are wiped by the engine's post-patches, so locate the
+        // packed payload by scanning for the 'ARGL' magic at the start of any
+        // section instead of matching a hardcoded name.
         for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-            if (std::memcmp(sections[i].Name, ".diwnxss\0", 7) == 0) {
-                section_data = base + sections[i].VirtualAddress;
+            uint8_t* candidate = base + sections[i].VirtualAddress;
+            if (sections[i].Misc.VirtualSize < sizeof(PackedHeader)) continue;
+            auto* hdr_probe = reinterpret_cast<PackedHeader*>(candidate);
+            if (hdr_probe->magic == 0x4C475241u) {
+                section_data = candidate;
                 break;
             }
         }
         if (!section_data) return false;
 
-        // Parse header
         auto* hdr = reinterpret_cast<PackedHeader*>(section_data);
-        if (hdr->magic != 0x4C475241) return false; // 'ARGL'
 
         // Get region descriptors
         auto* regions = reinterpret_cast<RegionDescriptor*>(

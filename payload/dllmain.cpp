@@ -61,18 +61,23 @@ static void init_tamper_guards() {
     auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)hmod + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
 
-    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    uint16_t nsec = nt->FileHeader.NumberOfSections;
-
     g_nguards = 0;
-    for (uint16_t i = 0; i < nsec && g_nguards < 2; ++i) {
-        char name[9] = {};
-        memcpy(name, sec[i].Name, 8);
-        if (!strcmp(name, ".text") || !strcmp(name, ".rdata")) {
-            const uint8_t* base = (const uint8_t*)hmod + sec[i].VirtualAddress;
-            size_t         sz   = sec[i].Misc.VirtualSize;
-            g_guards[g_nguards++] = { base, sz, crc32_buf(base, sz) };
-        }
+
+    // Section names are wiped by the engine, so derive the code-region guard
+    // from the optional header's BaseOfCode/SizeOfCode (set at link time and
+    // preserved through obfuscation). The second guard covers the import
+    // descriptor block, which catches IAT-rewriting tools.
+    uint32_t code_rva = nt->OptionalHeader.BaseOfCode;
+    uint32_t code_sz  = nt->OptionalHeader.SizeOfCode;
+    if (code_rva && code_sz) {
+        const uint8_t* base = (const uint8_t*)hmod + code_rva;
+        g_guards[g_nguards++] = { base, code_sz, crc32_buf(base, code_sz) };
+    }
+
+    auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imp_dir.VirtualAddress && imp_dir.Size && g_nguards < 2) {
+        const uint8_t* base = (const uint8_t*)hmod + imp_dir.VirtualAddress;
+        g_guards[g_nguards++] = { base, imp_dir.Size, crc32_buf(base, imp_dir.Size) };
     }
 
     if (g_nguards > 0) {
